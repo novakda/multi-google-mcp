@@ -84,25 +84,45 @@ export const gmailTools = [
       const headers = res.data.payload?.headers || [];
       const get = (name: string) => headers.find((h) => h.name === name)?.value || "";
 
-      // Extract body text
-      let body = "";
-      function extractText(part: any): void {
-        if (part.mimeType === "text/plain" && part.body?.data) {
-          body += Buffer.from(part.body.data, "base64url").toString("utf-8");
+      // Extract body — prefer text/plain, fall back to text/html (stripped to text),
+      // and only THEN the snippet. HTML-only emails (most newsletters + transactional
+      // mail) carry no text/plain part; the old code found nothing and returned just the
+      // snippet, truncating the body mid-sentence. Walk collects both and prefers plain.
+      let plain = "";
+      let html = "";
+      function walk(part: any): void {
+        const data = part?.body?.data;
+        if (data) {
+          if (part.mimeType === "text/plain") plain += Buffer.from(data, "base64url").toString("utf-8");
+          else if (part.mimeType === "text/html") html += Buffer.from(data, "base64url").toString("utf-8");
         }
-        if (part.parts) {
-          part.parts.forEach(extractText);
-        }
+        if (part?.parts) part.parts.forEach(walk);
       }
+      if (res.data.payload) walk(res.data.payload);
 
-      if (res.data.payload) {
-        extractText(res.data.payload);
-      }
+      const htmlToText = (h: string): string =>
+        h
+          .replace(/<!--[\s\S]*?-->/g, "")
+          .replace(/<(script|style|head)[\s\S]*?<\/\1>/gi, "")
+          .replace(/<\/(p|div|tr|h[1-6]|li|ul|ol|blockquote|table)>/gi, "\n")
+          .replace(/<br\s*\/?>/gi, "\n")
+          .replace(/<[^>]+>/g, "")
+          .replace(/&nbsp;/gi, " ")
+          .replace(/&amp;/gi, "&")
+          .replace(/&lt;/gi, "<")
+          .replace(/&gt;/gi, ">")
+          .replace(/&quot;/gi, '"')
+          .replace(/&#0?39;|&apos;/gi, "'")
+          .replace(/&#(\d+);/g, (_m, n) => String.fromCharCode(+n))
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n{3,}/g, "\n\n")
+          .replace(/[ \t]{2,}/g, " ")
+          .trim();
 
-      // Fallback to snippet if no plain text found
-      if (!body && res.data.snippet) {
-        body = res.data.snippet;
-      }
+      // Preferred order: real plain-text > HTML rendered to text > snippet (last resort).
+      let body = plain.trim();
+      if (!body && html.trim()) body = htmlToText(html);
+      if (!body && res.data.snippet) body = res.data.snippet;
 
       const email = {
         id: res.data.id,
