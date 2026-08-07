@@ -14,6 +14,35 @@ export function createOAuth2Client(clientId: string, clientSecret: string) {
   return new google.auth.OAuth2(clientId, clientSecret, REDIRECT_URI);
 }
 
+const escapeHtml = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+   .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+/**
+ * Render the REAL failure into the browser response.
+ *
+ * The callback page is frequently the only surface the operator can actually read — a terminal
+ * running this may be scrolled away, in another pane, or (Dan's case) one he cannot copy text out
+ * of. Returning a bare "Internal error" 500 throws away the one piece of information that would
+ * have explained the failure, which is exactly what happened on 2026-08-06: a 500 with no detail,
+ * and the cause (an expired auth code) only recoverable by re-running under a logging wrapper.
+ */
+function failurePage(err: unknown): string {
+  const e = err as { message?: string; response?: { data?: unknown } };
+  const detail = e?.response?.data
+    ? `${e.message ?? "error"}\n\n${JSON.stringify(e.response.data, null, 2)}`
+    : (e?.message ?? String(err));
+  return `<!doctype html><html><body style="font-family:system-ui;padding:2rem;max-width:46rem;margin:0 auto">
+    <h1 style="margin:0 0 .5rem">Authorization failed</h1>
+    <p style="color:#555;margin:0 0 1rem">The actual error, rather than a generic one:</p>
+    <pre style="background:#f5f5f7;padding:1rem;border-radius:8px;white-space:pre-wrap;word-wrap:break-word;font-size:13px">${escapeHtml(detail)}</pre>
+    <p style="color:#555;font-size:14px">Common causes: the authorization code expired (the consent
+    screen sat open too long &mdash; just run it again), a <code>redirect_uri</code> that is not
+    registered for this OAuth client, or a revoked refresh token.</p>
+    <p style="color:#555;font-size:14px">The same output went to the terminal.</p>
+  </body></html>`;
+}
+
 export function getAuthenticatedClient(accountName: string) {
   const config = loadConfig();
   if (!config.clientId || !config.clientSecret) {
@@ -47,7 +76,7 @@ export function getAuthenticatedClient(accountName: string) {
  * Runs the OAuth flow: opens browser, catches the callback, stores tokens.
  * Returns the account label.
  */
-export async function runOAuthFlow(accountLabel: string): Promise<void> {
+export async function runOAuthFlow(accountLabel: string, loginHint?: string): Promise<void> {
   const config = loadConfig();
   const client = createOAuth2Client(config.clientId, config.clientSecret);
 
@@ -55,6 +84,7 @@ export async function runOAuthFlow(accountLabel: string): Promise<void> {
     access_type: "offline",
     scope: SCOPES,
     prompt: "consent", // force consent to always get refresh_token
+    ...(loginHint ? { login_hint: loginHint } : {}),
   });
 
   return new Promise((resolve, reject) => {
@@ -104,8 +134,9 @@ export async function runOAuthFlow(accountLabel: string): Promise<void> {
         server.close();
         resolve();
       } catch (err) {
-        res.writeHead(500);
-        res.end("Internal error");
+        res.writeHead(500, { "Content-Type": "text/html" });
+        res.end(failurePage(err));
+        console.error(`\n  AUTH FAILED: ${(err as Error).message}\n`);
         server.close();
         reject(err);
       }
