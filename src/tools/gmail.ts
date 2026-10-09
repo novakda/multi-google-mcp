@@ -7,6 +7,39 @@ function getGmail(account: string) {
   return google.gmail({ version: "v1", auth });
 }
 
+// RFC 2047: a raw non-ASCII Subject is read by Gmail as latin-1 (mojibake) and truncated (#1191).
+// Encoded-words are capped at 75 chars, so split on character boundaries at <=45 UTF-8 bytes.
+export function encodeHeader(value: string): string {
+  if (!/[^\x00-\x7F]/.test(value)) return value;
+  const words: string[] = [];
+  let chunk = "";
+  for (const ch of value) {
+    if (Buffer.byteLength(chunk + ch, "utf8") > 45) { words.push(chunk); chunk = ""; }
+    chunk += ch;
+  }
+  if (chunk) words.push(chunk);
+  return words.map((w) => `=?UTF-8?B?${Buffer.from(w, "utf8").toString("base64")}?=`).join("\r\n ");
+}
+
+type Mail = { to: string; subject: string; body: string; cc?: string; bcc?: string; inReplyTo?: string; references?: string };
+
+export function buildRaw(m: Mail): string {
+  const h = [`To: ${m.to}`, `Subject: ${encodeHeader(m.subject)}`, "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64"];
+  if (m.cc) h.push(`Cc: ${m.cc}`);
+  if (m.bcc) h.push(`Bcc: ${m.bcc}`);
+  if (m.inReplyTo) h.push(`In-Reply-To: ${m.inReplyTo}`);
+  if (m.inReplyTo || m.references) h.push(`References: ${m.references ?? m.inReplyTo}`);
+  const body = Buffer.from(m.body, "utf8").toString("base64").replace(/.{76}/g, "$&\r\n");
+  return Buffer.from(`${h.join("\r\n")}\r\n\r\n${body}`).toString("base64url");
+}
+
+const threadProps = {
+  threadId: { type: "string", description: "Gmail thread ID to reply in (keeps the reply in the existing conversation)" },
+  inReplyTo: { type: "string", description: "Message-ID header of the message being replied to, e.g. <abc@mail.gmail.com>" },
+  references: { type: "string", description: "References header; defaults to inReplyTo" },
+};
+
 function accountDescription() {
   const names = getAccountNames();
   if (names.length === 0) return "No accounts configured.";
@@ -149,21 +182,15 @@ export const gmailTools = [
         body: { type: "string", description: "Email body (plain text)" },
         cc: { type: "string", description: "CC recipients (comma-separated)" },
         bcc: { type: "string", description: "BCC recipients (comma-separated)" },
+        ...threadProps,
       },
       required: ["account", "to", "subject", "body"],
     },
-    handler: async (args: { account: string; to: string; subject: string; body: string; cc?: string; bcc?: string }) => {
+    handler: async (args: Mail & { account: string; threadId?: string }) => {
       const gmail = getGmail(args.account);
-
-      let headers = `To: ${args.to}\nSubject: ${args.subject}\nContent-Type: text/plain; charset=utf-8\n`;
-      if (args.cc) headers += `Cc: ${args.cc}\n`;
-      if (args.bcc) headers += `Bcc: ${args.bcc}\n`;
-
-      const raw = Buffer.from(`${headers}\n${args.body}`).toString("base64url");
-
       const res = await gmail.users.messages.send({
         userId: "me",
-        requestBody: { raw },
+        requestBody: { raw: buildRaw(args), threadId: args.threadId },
       });
 
       return {
@@ -181,19 +208,16 @@ export const gmailTools = [
         to: { type: "string", description: "Recipient email address" },
         subject: { type: "string", description: "Email subject" },
         body: { type: "string", description: "Email body (plain text)" },
+        cc: { type: "string", description: "CC recipients (comma-separated)" },
+        ...threadProps,
       },
       required: ["account", "to", "subject", "body"],
     },
-    handler: async (args: { account: string; to: string; subject: string; body: string }) => {
+    handler: async (args: Mail & { account: string; threadId?: string }) => {
       const gmail = getGmail(args.account);
-
-      const raw = Buffer.from(
-        `To: ${args.to}\nSubject: ${args.subject}\nContent-Type: text/plain; charset=utf-8\n\n${args.body}`
-      ).toString("base64url");
-
       const res = await gmail.users.drafts.create({
         userId: "me",
-        requestBody: { message: { raw } },
+        requestBody: { message: { raw: buildRaw(args), threadId: args.threadId } },
       });
 
       return {
