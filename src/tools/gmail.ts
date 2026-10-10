@@ -81,8 +81,15 @@ export const gmailTools = [
           });
           const headers = full.data.payload?.headers || [];
           const get = (name: string) => headers.find((h) => h.name === name)?.value || "";
+          // #1926: report send-status from labels, never from the query shape — a 'resume sent' claim
+          // was once made off a search result that was really a draft.
+          const labels = full.data.labelIds ?? [];
+          const status = labels.includes("DRAFT") ? "draft" : labels.includes("SENT") ? "sent" : "received";
           return {
             id: msg.id,
+            threadId: full.data.threadId,
+            status,
+            labels,
             subject: get("Subject"),
             from: get("From"),
             to: get("To"),
